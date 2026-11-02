@@ -1,0 +1,86 @@
+name: Build and publish QuickBooks Sync
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qb-sync-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Prepare build configuration
+        shell: pwsh
+        run: Copy-Item .\App.config.example .\App.config
+
+      - name: Restore NuGet packages
+        run: nuget restore .\QB_SQL_Sync.sln -NonInteractive
+
+      - name: Build Release
+        run: msbuild .\QB_SQL_Sync.sln /m /p:Configuration=Release '/p:Platform=Any CPU' /p:RestorePackagesConfig=true /verbosity:minimal
+
+      - name: Upload publish output
+        uses: actions/upload-artifact@v4
+        with:
+          name: qb-sync-publish
+          path: QB_SQL_Sync\bin\Release\*
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, Windows, X64, HeliasLLC]
+    steps:
+      - name: Download build output
+        uses: actions/download-artifact@v4
+        with:
+          name: qb-sync-publish
+          path: ${{ runner.temp }}\qb-sync-publish
+
+      - name: Publish to HeliasLLC
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $env:RUNNER_TEMP 'qb-sync-publish'
+          $publish = 'D:\QUICKBOOK_CURRENT_RUNNER_SYNC\publish'
+          $legacyConfig = 'D:\QUICKBOOK_CURRENT_RUNNER_SYNC\QB_Sync_Helias_Published\QB_SQL_Sync.exe.config'
+          $publishConfig = Join-Path $publish 'QB_SQL_Sync.exe.config'
+
+          if (-not (Test-Path -LiteralPath $package)) {
+            throw "Build artifact folder not found: $package"
+          }
+
+          New-Item -ItemType Directory -Path $publish -Force | Out-Null
+
+          if (-not (Test-Path -LiteralPath $publishConfig)) {
+            if (-not (Test-Path -LiteralPath $legacyConfig)) {
+              throw "No existing runtime config found at $legacyConfig; refusing to publish without application settings."
+            }
+            Copy-Item -LiteralPath $legacyConfig -Destination $publishConfig
+          }
+
+          Get-ChildItem -LiteralPath $package -Force |
+            Where-Object { $_.Name -ne 'QB_SQL_Sync.exe.config' } |
+            ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $publish -Recurse -Force }
+
+          if (-not (Test-Path -LiteralPath (Join-Path $publish 'QB_SQL_Sync.exe'))) {
+            throw 'Publish completed without QB_SQL_Sync.exe.'
+          }
+
+          "Published commit $env:GITHUB_SHA to $publish" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
